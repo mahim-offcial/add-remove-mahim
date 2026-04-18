@@ -1,592 +1,224 @@
-from flask import Flask, request, jsonify
-import sys
-import jwt
-import requests
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-import RemoveFriend_Req_pb2
-from byte import Encrypt_ID, encrypt_api
-import binascii
-import data_pb2
-import uid_generator_pb2
-import my_pb2
-import output_pb2
-from datetime import datetime
-import json
-import time
-import urllib3
-import warnings
+# main_app.py
 
-# -----------------------------
-# Security Warnings Disable
-# -----------------------------
-# HTTPS warnings disable karo
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=UserWarning, message="Unverified HTTPS request")
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+import httpx
+import time
+import re
+import json
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from flask import Flask, request, jsonify
+from datetime import datetime
+import jwt as pyjwt
+import data_pb2
+
+# --- Protobuf Imports (নিশ্চিত করুন এই ফাইলগুলো আপনার প্রোজেক্টে আছে) ---
+# এই ফাইলগুলো আপনার কাছে না থাকলে কোডটি কাজ করবে না।
+try:
+    import data_pb2
+    import encode_id_clan_pb2
+    import reqClan_pb2
+except ImportError:
+    print("Error: Protobuf files (data_pb2.py, etc.) not found. Please generate them first.")
+    exit(1)
+
+# --- Configuration (কনফিগারেশন) ---
+# এই মানগুলো সহজেই পরিবর্তন করা যাবে
+FREEFIRE_VERSION = "OB53"
+JWT_REGEX = re.compile(r'(eyJ[A-Za-z0-9_\-\.=]+)')
+
+# --- Security: Load secrets from environment variables (নিরাপত্তা: এনভায়রনমেন্ট ভ্যারিয়েবল থেকে গোপন তথ্য লোড করুন) ---
+# সরাসরি কোডে key/iv না লিখে এনভায়রনমেন্ট ভ্যারিয়েবল ব্যবহার করা নিরাপদ
+# উদাহরণ: export AES_KEY="89,103,38,..."
+try:
+    AES_KEY_STR = os.environ.get("AES_KEY", "89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56")
+    AES_IV_STR = os.environ.get("AES_IV", "54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37")
+    
+    AES_KEY = bytes([int(k) for k in AES_KEY_STR.split(',')])
+    AES_IV = bytes([int(i) for i in AES_IV_STR.split(',')])
+except (ValueError, TypeError) as e:
+    print(f"Error: Invalid format for AES_KEY or AES_IV in environment variables. Error: {e}")
+    exit(1)
+
 
 app = Flask(__name__)
 
-# -----------------------------
-# AES Configuration
-# -----------------------------
-AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
-AES_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+# --- Helper Functions (সহায়ক ফাংশন) ---
 
-def encrypt_message(data_bytes):
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
-    return cipher.encrypt(pad(data_bytes, AES.block_size))
-
-def encrypt_message_hex(data_bytes):
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
-    encrypted = cipher.encrypt(pad(data_bytes, AES.block_size))
-    return binascii.hexlify(encrypted).decode('utf-8')
-
-# -----------------------------
-# Region-based URL Configuration
-# -----------------------------
-def get_base_url(server_name):
-    server_name = server_name.upper()
-    if server_name == "BD":
-        return "https://clientbp.ggwhitehawk.com/"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        return "https://client.us.freefiremobile.com/"
-    else:
-        return "https://clientbp.ggblueshark.com/"
-
-def get_server_from_token(token):
-    """Extract server region from JWT token"""
+def get_jwt_token_from_api(uid, password):
+    data_param = f"{uid}:{password}"
+    url = f"https://api.freefireservice.dnc.su/oauth/account:login?data={data_param}"
     try:
-        decoded = jwt.decode(token, options={"verify_signature": False})
-        lock_region = decoded.get("lock_region", "BD")
-        return lock_region.upper()
-    except:
-        return "BD"
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(url)
+            response.raise_for_status() # HTTP 4xx/5xx এররের জন্য exception তুলবে
 
-# -----------------------------
-# Retry Decorator - 10 baar try karega
-# -----------------------------
-def retry_operation(max_retries=10, delay=1):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_retries):
-                try:
-                    result = func(*args, **kwargs)
-                    if result and result.get('status') in ['success', 'failed']:
-                        return result
-                    # Agar result nahi aaya toh retry karo
-                    print(f"Attempt {attempt + 1}/{max_retries} failed, retrying...")
-                except Exception as e:
-                    last_exception = e
-                    print(f"Attempt {attempt + 1}/{max_retries} failed with error: {str(e)}")
-                
-                if attempt < max_retries - 1:
-                    time.sleep(delay)
-            
-            # Agar 10 baar mein bhi fail hua toh last error return karo
-            if last_exception:
-                return {
-                    "status": "error",
-                    "message": f"All {max_retries} attempts failed",
-                    "error": str(last_exception)
-                }
-            return {
-                "status": "error", 
-                "message": f"All {max_retries} attempts failed"
-            }
-        return wrapper
-    return decorator
+        # JWT খোঁজার জন্য একাধিক পদ্ধতি
+        try:
+            data = response.json()
+            for key in ("token", "jwt", "access_token", "data", "auth"):
+                token = data.get(key)
+                if isinstance(token, str) and token.startswith("ey"):
+                    return token
+        except json.JSONDecodeError:
+            pass # যদি রেসপন্স JSON না হয়, তাহলে টেক্সট থেকে খোঁজা হবে
 
-# -----------------------------
-# JWT Token Generation Functions - FIXED
-# -----------------------------
-def get_token_from_uid_password(uid, password):
-    """Get JWT token using UID and password - FIXED VERSION"""
-    try:
-        oauth_url = "https://100067.connect.garena.com/oauth/guest/token/grant"
-        payload = {
-            'uid': uid,
-            'password': password,
-            'response_type': "token",
-            'client_type': "2",
-            'client_secret': "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-            'client_id': "100067"
-        }
-        
-        headers = {
-            'User-Agent': "GarenaMSDK/4.0.19P9(SM-M526B ;Android 13;pt;BR;)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip"
-        }
+        match = JWT_REGEX.search(response.text)
+        if match:
+            return match.group(1)
 
-        oauth_response = requests.post(oauth_url, data=payload, headers=headers, timeout=10, verify=False)
-        oauth_response.raise_for_status()
+        for header_value in response.headers.values():
+            match = JWT_REGEX.search(header_value)
+            if match:
+                return match.group(1)
         
-        oauth_data = oauth_response.json()
-        
-        if 'access_token' not in oauth_data:
-            return None, "OAuth response missing access_token"
-
-        access_token = oauth_data['access_token']
-        open_id = oauth_data.get('open_id', '')
-        
-        # Try platforms with the obtained credentials
-        platforms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        
-        for platform_type in platforms:
-            result = try_platform_login(open_id, access_token, platform_type)
-            if result and 'token' in result:
-                return result['token'], None
-        
-        return None, "Login successful but JWT generation failed on all platforms"
-
-    except requests.RequestException as e:
-        return None, f"OAuth request failed: {str(e)}"
-    except ValueError:
-        return None, "Invalid JSON response from OAuth service"
+        return None
+    except httpx.RequestError as e:
+        print(f"JWT Token API request error: {e}")
+        return None
     except Exception as e:
-        return None, f"Unexpected error: {str(e)}"
+        print(f"An unexpected error occurred while getting JWT token: {e}")
+        return None
 
-def try_platform_login(open_id, access_token, platform_type):
-    """Try login for a specific platform - IMPROVED VERSION"""
+def get_region_from_jwt(jwt_token):
     try:
-        game_data = my_pb2.GameData()
-        game_data.timestamp = "2024-12-05 18:15:32"
-        game_data.game_name = "free fire"
-        game_data.game_version = 1
-        game_data.version_code = "1.123.2"
-        game_data.os_info = "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)"
-        game_data.device_type = "Handheld"
-        game_data.network_provider = "Verizon Wireless"
-        game_data.connection_type = "WIFI"
-        game_data.screen_width = 1280
-        game_data.screen_height = 960
-        game_data.dpi = "240"
-        game_data.cpu_info = "ARMv7 VFPv3 NEON VMH | 2400 | 4"
-        game_data.total_ram = 5951
-        game_data.gpu_name = "Adreno (TM) 640"
-        game_data.gpu_version = "OpenGL ES 3.0"
-        game_data.user_id = "Google|74b585a9-0268-4ad3-8f36-ef41d2e53610"
-        game_data.ip_address = "172.190.111.97"
-        game_data.language = "en"
-        game_data.open_id = open_id
-        game_data.access_token = access_token
-        game_data.platform_type = platform_type
-        game_data.field_99 = str(platform_type)
-        game_data.field_100 = str(platform_type)
+        decoded = pyjwt.decode(jwt_token, options={"verify_signature": False})
+        return decoded.get('lock_region', 'BD').upper()
+    except pyjwt.PyJWTError as e:
+        print(f"JWT decode error: {e}")
+        return 'BD' # ডিফল্ট একটি মান দেওয়া হলো
 
-        serialized_data = game_data.SerializeToString()
-        encrypted_data = encrypt_message(serialized_data)
-        hex_encrypted_data = binascii.hexlify(encrypted_data).decode('utf-8')
-
-        url = "https://loginbp.ggblueshark.com/MajorLogin"
-        headers = {
-            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "Content-Type": "application/octet-stream",
-            "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.11f1",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB53"
-        }
-        
-        edata = bytes.fromhex(hex_encrypted_data)
-
-        response = requests.post(url, data=edata, headers=headers, timeout=10, verify=False)
-        response.raise_for_status()
-
-        if response.status_code == 200:
-            # Parse response
-            data_dict = None
-            try:
-                example_msg = output_pb2.Garena_420()
-                example_msg.ParseFromString(response.content)
-                data_dict = {field.name: getattr(example_msg, field.name)
-                             for field in example_msg.DESCRIPTOR.fields
-                             if field.name not in ["binary", "binary_data", "Garena420"]}
-            except Exception as e:
-                try:
-                    data_dict = response.json()
-                except ValueError:
-                    return None
-
-            if data_dict and "token" in data_dict:
-                token_value = data_dict["token"]
-                try:
-                    decoded_token = jwt.decode(token_value, options={"verify_signature": False})
-                except Exception:
-                    decoded_token = {}
-
-                return {
-                    "account_id": decoded_token.get("account_id"),
-                    "account_name": decoded_token.get("nickname"),
-                    "open_id": open_id,
-                    "access_token": access_token,
-                    "platform": decoded_token.get("external_type"),
-                    "region": decoded_token.get("lock_region"),
-                    "status": "success",
-                    "token": token_value
-                }
-        
-        return None
-
-    except Exception:
-        return None
-
-# -----------------------------
-# Player Info Functions
-# -----------------------------
-def create_info_protobuf(uid):
-    message = uid_generator_pb2.uid_generator()
-    message.saturn_ = int(uid)
-    message.garena = 1
-    return message.SerializeToString()
-
-def get_player_info(target_uid, token, server_name=None):
-    """Get detailed player information"""
-    try:
-        if not server_name:
-            server_name = get_server_from_token(token)
-            
-        protobuf_data = create_info_protobuf(target_uid)
-        encrypted_data = encrypt_message_hex(protobuf_data)
-        endpoint = get_base_url(server_name) + "GetPlayerPersonalShow"
-
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB53"
-        }
-
-        response = requests.post(endpoint, data=bytes.fromhex(encrypted_data), headers=headers, verify=False)
-        
-        if response.status_code != 200:
-            return None
-
-        hex_response = response.content.hex()
-        binary = bytes.fromhex(hex_response)
-        
-        info = data_pb2.AccountPersonalShowInfo()
-        info.ParseFromString(binary)
-        
-        return info
-    except Exception as e:
-        print(f"Error getting player info: {e}")
-        return None
-
-def extract_player_info(info_data):
-    """Extract player information from protobuf response"""
-    if not info_data:
-        return None
-
-    basic_info = info_data.basic_info
-    return {
-        'uid': basic_info.account_id,
-        'nickname': basic_info.nickname,
-        'level': basic_info.level,
-        'region': basic_info.region,
-        'likes': basic_info.liked,
-        'release_version': basic_info.release_version
+def get_region_url(region):
+    region_map = {
+        "BD": "https://clientbp.ggwhitehawk.com",
+        "BR": "https://client.us.freefiremobile.com/",
+        "US": "https://client.us.freefiremobile.com/",
+        "SAC": "https://client.us.freefiremobile.com/",
+        "NA": "https://client.us.freefiremobile.com/",
     }
+    return region_map.get(region.upper(), "https://clientbp.ggblueshark.com/")
 
-# -----------------------------
-# Authentication Helper Functions
-# -----------------------------
-def decode_author_uid(token):
-    try:
-        decoded = jwt.decode(token, options={"verify_signature": False})
-        return decoded.get("account_id") or decoded.get("sub")
-    except:
-        return None
+def create_encrypted_payload(data_to_serialize):
+    serialized_data = data_to_serialize.SerializeToString()
+    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
+    encrypted_data = cipher.encrypt(pad(serialized_data, AES.block_size))
+    return encrypted_data
 
-# -----------------------------
-# Friend Management Functions - WITH RETRY
-# -----------------------------
-@retry_operation(max_retries=10, delay=1)
-def remove_friend_with_retry(author_uid, target_uid, token, server_name=None):
-    """Remove friend with retry mechanism"""
+def get_clan_info(base_url, jwt_token, clan_id):
     try:
-        if not server_name:
-            server_name = get_server_from_token(token)
-            
-        # Get player info
-        player_info = get_player_info(target_uid, token, server_name)
+        clan_info_req = encode_id_clan_pb2.MyData()
+        clan_info_req.field1 = clan_id
+        clan_info_req.field2 = 1 # ডিফল্ট মান
         
-        msg = RemoveFriend_Req_pb2.RemoveFriend()
-        msg.AuthorUid = int(author_uid)
-        msg.TargetUid = int(target_uid)
-        encrypted_bytes = encrypt_message(msg.SerializeToString())
+        encrypted_info_data = create_encrypted_payload(clan_info_req)
 
-        url = get_base_url(server_name) + "RemoveFriend"
+        info_url = f"{base_url}/GetClanInfoByClanID"
         headers = {
-            'Authorization': f"Bearer {token}",
-            'User-Agent': "Dalvik/2.1.0 (Linux; Android 9)",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB53"
+            "Authorization": f"Bearer {jwt_token}",
+            "ReleaseVersion": FREEFIRE_VERSION,
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
         }
 
-        res = requests.post(url, data=encrypted_bytes, headers=headers, verify=False)
+        with httpx.Client(timeout=15.0) as client:
+            info_response = client.post(info_url, headers=headers, content=encrypted_info_data)
+            info_response.raise_for_status()
         
-        # Extract player info
-        player_data = None
-        if player_info:
-            player_data = extract_player_info(player_info)
+        resp_info = data_pb2.response()
+        resp_info.ParseFromString(info_response.content)
         
-        # Check if successful
-        if res.status_code == 200:
-            status = "success"
-        else:
-            status = "failed"
-            # Force retry by raising exception
-            raise Exception(f"HTTP {res.status_code}: {res.text}")
-        
-        # Simplified response format
-        response_data = {
-            "author_uid": author_uid,
-            "nickname": player_data.get('nickname') if player_data else "Unknown",
-            "uid": target_uid,
-            "level": player_data.get('level') if player_data else 0,
-            "likes": player_data.get('likes') if player_data else 0,
-            "region": player_data.get('region') if player_data else "Unknown",
-            "release_version": player_data.get('release_version') if player_data else "Unknown",
-            "status": status,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "clan_name": getattr(resp_info, "special_code", "Unknown"),
+            "clan_level": getattr(resp_info, "level", "Unknown")
         }
-        
-        return response_data
-
     except Exception as e:
-        print(f"Remove friend error: {e}")
-        raise e  # Retry ke liye exception raise karo
+        print(f"Clan info retrieval error: {e}")
+        return {"clan_name": "Unknown", "clan_level": "Unknown"}
 
-@retry_operation(max_retries=10, delay=1)
-def send_friend_request_with_retry(author_uid, target_uid, token, server_name=None):
-    """Send friend request with retry mechanism"""
+# --- API Endpoint ---
+@app.route('/join', methods=['POST'])
+def join_clan():
+    # POST রিকোয়েস্টের বডি থেকে JSON ডেটা গ্রহণ করা হচ্ছে
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON in request body"}), 400
+
+    clan_id_str = data.get('clan_id')
+    jwt_token = data.get('jwt')
+    uid = data.get('uid')
+    password = data.get('password')
+
+    if not clan_id_str:
+        return jsonify({"error": "clan_id is required"}), 400
+    
     try:
-        if not server_name:
-            server_name = get_server_from_token(token)
-            
-        # Get player info
-        player_info = get_player_info(target_uid, token, server_name)
-        
-        encrypted_id = Encrypt_ID(target_uid)
-        payload = f"08a7c4839f1e10{encrypted_id}1801"
-        encrypted_payload = encrypt_api(payload)
+        clan_id = int(clan_id_str)
+    except (ValueError, TypeError):
+        return jsonify({"error": "clan_id must be a valid integer"}), 400
 
-        url = get_base_url(server_name) + "RequestAddingFriend"
+    if not jwt_token and not (uid and password):
+        return jsonify({"error": "Either 'jwt' or both 'uid' and 'password' are required"}), 400
+
+    final_token = jwt_token
+    if not final_token:
+        print(f"Attempting to get JWT for UID: {uid}")
+        final_token = get_jwt_token_from_api(uid, password)
+        if not final_token:
+            return jsonify({"error": "Failed to get JWT token from uid/password. Check credentials or external API status."}), 401
+
+    final_region = get_region_from_jwt(final_token)
+    base_url = get_region_url(final_region)
+    url = f"{base_url}/RequestJoinClan"
+    
+    try:
+        # Join request payload তৈরি
+        join_req_message = reqClan_pb2.MyMessage()
+        join_req_message.field_1 = clan_id
+        encrypted_data = create_encrypted_payload(join_req_message)
+
         headers = {
-            "Authorization": f"Bearer {token}",
-            "X-Unity-Version": "2018.4.11f1",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB53",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Dalvik/2.1.0 (Linux; Android 9)"
+            "Authorization": f"Bearer {final_token}",
+            "ReleaseVersion": FREEFIRE_VERSION,
+            "Content-Type": "application/octet-stream",
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
         }
 
-        r = requests.post(url, headers=headers, data=bytes.fromhex(encrypted_payload), verify=False)
-        
-        # Extract player info
-        player_data = None
-        if player_info:
-            player_data = extract_player_info(player_info)
-        
-        # Check if successful
-        if r.status_code == 200:
-            status = "success"
-        else:
-            status = "failed"
-            # Force retry by raising exception
-            raise Exception(f"HTTP {r.status_code}: {r.text}")
-        
-        # Simplified response format
-        response_data = {
-            "author_uid": author_uid,
-            "nickname": player_data.get('nickname') if player_data else "Unknown",
-            "uid": target_uid,
-            "level": player_data.get('level') if player_data else 0,
-            "likes": player_data.get('likes') if player_data else 0,
-            "region": player_data.get('region') if player_data else "Unknown",
-            "release_version": player_data.get('release_version') if player_data else "Unknown",
-            "status": status,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(url, headers=headers, content=encrypted_data)
+            response.raise_for_status() # ব্যর্থ হলে (4xx/5xx) এরর দেবে
+
+        clan_info = get_clan_info(base_url, final_token, clan_id)
+
+        result = {
+            "success": True,
+            "message": "Request sent successfully",
+            "status_code": response.status_code,
+            "clan_id": clan_id,
+            "region": final_region,
+            "clan_name": clan_info.get("clan_name"),
+            "clan_level": clan_info.get("clan_level"),
+            "timestamp": datetime.utcnow().isoformat()
         }
-        
-        return response_data
-        
+        return jsonify(result), 200
+
+    except httpx.HTTPStatusError as e:
+        return jsonify({
+            "success": False,
+            "error": "Request to game server failed",
+            "details": f"Status code: {e.response.status_code}. Response: {e.response.text}",
+            "clan_id": clan_id
+        }), e.response.status_code
     except Exception as e:
-        print(f"Add friend error: {e}")
-        raise e  # Retry ke liye exception raise karo
-
-# -----------------------------
-# Customized API Routes
-# -----------------------------
-
-@app.route('/adding_friend', methods=['GET'])
-def adding_friend_custom():
-    """URL: /adding_friend?uid={uid}&password={password}&friend_uid={target_uid}"""
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    friend_uid = request.args.get('friend_uid')
-    server_name = request.args.get('server_name', 'IND')
-
-    if not uid or not password or not friend_uid:
-        return jsonify({"status": "failed", "message": "Missing uid, password, or friend_uid"}), 400
-
-    token, error = get_token_from_uid_password(uid, password)
-    if error:
-        return jsonify({"status": "failed", "message": error}), 400
-    
-    author_uid = decode_author_uid(token)
-    result = send_friend_request_with_retry(author_uid, friend_uid, token, server_name)
-    return jsonify(result)
-
-@app.route('/adding_friend_by_token', methods=['GET'])
-def adding_friend_by_token():
-    """URL: /adding_friend_by_token?jwt_token={jwt_token}&friend_uid={target_uid}&server_name={server_name}"""
-    jwt_token = request.args.get('jwt_token')
-    friend_uid = request.args.get('friend_uid')
-    server_name = request.args.get('server_name', 'IND')
-
-    if not jwt_token or not friend_uid:
-        return jsonify({"status": "failed", "message": "Missing jwt_token or friend_uid"}), 400
-
-    # Validate JWT token
-    author_uid = decode_author_uid(jwt_token)
-    if not author_uid:
-        return jsonify({"status": "failed", "message": "Invalid JWT token"}), 400
-    
-    result = send_friend_request_with_retry(author_uid, friend_uid, jwt_token, server_name)
-    return jsonify(result)
-
-@app.route('/remove_friend', methods=['GET'])
-def removing_friend_custom():
-    """URL: /removing_friend?uid={uid}&password={password}&friend_uid={target_uid}"""
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    friend_uid = request.args.get('friend_uid')
-    server_name = request.args.get('server_name', 'IND')
-
-    if not uid or not password or not friend_uid:
-        return jsonify({"status": "failed", "message": "Missing uid, password, or friend_uid"}), 400
-
-    token, error = get_token_from_uid_password(uid, password)
-    if error:
-        return jsonify({"status": "failed", "message": error}), 400
-    
-    author_uid = decode_author_uid(token)
-    result = remove_friend_with_retry(author_uid, friend_uid, token, server_name)
-    return jsonify(result)
-
-@app.route('/remove_friend_by_token', methods=['GET'])
-def removing_friend_by_token():
-    """URL: /remove_friend_by_token?jwt_token={jwt_token}&friend_uid={target_uid}&server_name={server_name}"""
-    jwt_token = request.args.get('jwt_token')
-    friend_uid = request.args.get('friend_uid')
-    server_name = request.args.get('server_name', 'IND')
-
-    if not jwt_token or not friend_uid:
-        return jsonify({"status": "failed", "message": "Missing jwt_token or friend_uid"}), 400
-
-    # Validate JWT token
-    author_uid = decode_author_uid(jwt_token)
-    if not author_uid:
-        return jsonify({"status": "failed", "message": "Invalid JWT token"}), 400
-    
-    result = remove_friend_with_retry(author_uid, friend_uid, jwt_token, server_name)
-    return jsonify(result)
-
-@app.route('/player_info', methods=['GET'])
-def player_info_custom():
-    """URL: /player_info?uid={uid}&password={password}&friend_uid={target_uid}"""
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    friend_uid = request.args.get('friend_uid')
-    server_name = request.args.get('server_name', 'IND')
-
-    if not uid or not password or not friend_uid:
-        return jsonify({"status": "failed", "message": "Missing uid, password, or friend_uid"}), 400
-
-    token, error = get_token_from_uid_password(uid, password)
-    if error:
-        return jsonify({"status": "failed", "message": error}), 400
-
-    player_info = get_player_info(friend_uid, token, server_name)
-    if not player_info:
-        return jsonify({"status": "failed", "message": "Info not found"}), 400
-
-    player_data = extract_player_info(player_info)
-    player_data.update({"status": "success", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-    return jsonify(player_data)
-
-@app.route('/player_info_by_token', methods=['GET'])
-def player_info_by_token():
-    """URL: /player_info_by_token?jwt_token={jwt_token}&friend_uid={target_uid}&server_name={server_name}"""
-    jwt_token = request.args.get('jwt_token')
-    friend_uid = request.args.get('friend_uid')
-    server_name = request.args.get('server_name', 'IND')
-
-    if not jwt_token or not friend_uid:
-        return jsonify({"status": "failed", "message": "Missing jwt_token or friend_uid"}), 400
-
-    # Validate JWT token
-    author_uid = decode_author_uid(jwt_token)
-    if not author_uid:
-        return jsonify({"status": "failed", "message": "Invalid JWT token"}), 400
-
-    player_info = get_player_info(friend_uid, jwt_token, server_name)
-    if not player_info:
-        return jsonify({"status": "failed", "message": "Info not found"}), 400
-
-    player_data = extract_player_info(player_info)
-    player_data.update({"status": "success", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-    return jsonify(player_data)
-
-# -----------------------------
-# JWT Generation Routes (Optional)
-# -----------------------------
-@app.route('/token', methods=['GET'])
-def oauth_guest():
-    """Get token using UID and password - FIXED"""
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    
-    if not uid or not password:
-        return jsonify({"message": "Missing uid or password"}), 400
-
-    token, error = get_token_from_uid_password(uid, password)
-    if error:
-        return jsonify({"message": error}), 400
-        
-    # Verify the token is valid
-    author_uid = decode_author_uid(token)
-    if not author_uid:
-        return jsonify({"message": "Generated token is invalid"}), 400
-        
-    return jsonify({
-        "status": "success",
-        "token": token,
-        "uid": uid,
-        "author_uid": author_uid
-    })
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "healthy", "service": "FreeFire-API"}), 200
-
-# -----------------------------
-# Run Server
-# ----------------------------
+        print(f"Server error during clan join request: {e}")
+        return jsonify({"error": "An internal server error occurred", "details": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-    
-#LEAK_OB53_BY_RIZER
+    # সার্ভার পোর্ট নির্ধারণ
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting Clan Join API on port {port}...")
+    # debug=False প্রোডাকশনের জন্য ভালো
+    app.run(host='0.0.0.0', port=port, debug=False)
